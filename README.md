@@ -1,4 +1,4 @@
-# CAPM & Rolling Window Regression — Mercedes-Benz AG (MBG.DE)
+# CAPM & Rolling Window Regression - Mercedes-Benz AG (MBG.DE)
 
 An empirical financial analysis of Mercedes-Benz AG's market risk using the **Capital Asset Pricing Model (CAPM)** and **Rolling Window Regression** in R. The project estimates the expected market return from the perspective of a CFO, with a strong focus on sensitivity analysis and the time-varying behaviour of Beta.
 
