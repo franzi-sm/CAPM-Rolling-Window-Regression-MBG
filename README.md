@@ -61,7 +61,7 @@ Each rolling window produces a Beta estimate with associated p-value and R², al
 ## Repository Structure
 
 ```
-📁 project/
+project/
 ├── CAPM_Rolling_Window_Regression_MBG_Notebook.Rmd   # Main analysis notebook
 ├── risk_free_monthly_5 years.rds                      # Pre-processed monthly Rf data
 ├── risk_free_daily_5 years.rds                        # Pre-processed daily Rf data
