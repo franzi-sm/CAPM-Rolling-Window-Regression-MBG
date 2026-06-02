@@ -1,0 +1,1162 @@
+---
+title: "CAPM & Rolling Window Regression"
+author: "Marleen Bünker, Denise Trinz, Eya Ben Romdhane & Franziska Meyndt"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+  html_notebook:
+    toc: true
+    number_sections: true
+---
+# Introduction
+**Topic 1: CAPM and Rolling Window Regression**
+
+You are the CFO of Mercedes AG and are interested in the **expected market return** of your company. You want to estimate it empirically using the CAPM model. Rather than relying on a single estimation approach, you conduct various sensitivity analyses. This includes in particular the application of a **Rolling Window Regression**, which illustrates the development of the expected market return over time.
+
+To run the code, a local path for the working directory must be set. The folder should contain all files needed to load external data. In the second step, the following packages must be installed and loaded.
+```{r setup, echo=TRUE, results='hide'}
+# This chunk sets global settings for the entire document
+
+# Set working directory – please adjust to your own path
+knitr::opts_chunk$set(
+  root.dir = "/Users/franziskameyndt/Desktop/Rolling Window Regression", # e.g. project folder
+  echo = TRUE,      # Show code
+  warning = FALSE,  # Suppress warnings
+  message = FALSE   # Suppress package messages
+)
+
+# Install packages (only needed once)
+# install.packages(c("tidyquant", "tidyverse", "broom", "slider", "ggplot2", "plotly", "lubridate", "htmltools", "shiny"))
+
+# Load required packages
+library(tidyverse)  # Data manipulation, visualization etc.
+library(broom)      # Tidy model outputs
+library(slider)     # Rolling window calculations
+library(ggplot2)    # Create plots
+library(plotly)     # Interactive visualizations
+library(lubridate)  # Date handling
+library(htmltools)  # HTML content e.g. in Shiny
+library(shiny)      # Interactive web apps
+library(zoo)  # Time series functions like as.yearmon (e.g. month extraction)
+library(tidyquant)  # For tq_get() and other finance functions
+```
+
+# Load Data {.tabset}
+After setting up the working directory and installing the required packages, the next data preparation step is to download the necessary data for the CAPM & Rolling Window Regression. The following parameters are defined:
+- Ri: Stock return = MBG.DE Adjusted Close prices.
+- Rm: Market return = DAX (German Stock Index) as the reference market.
+- Rf: Risk-free rate = "Daily yield of the current five-year Federal notes", Bundesbank (see Appendix).
+
+## Monthly Returns
+Load data from Yahoo Finance, set parameters & time period:
+```{r}
+start_date <- "2020-01-01"
+end_date <- "2024-12-31"
+symbols <- c("MBG.DE", "^GDAXI")  # Mercedes & DAX
+```
+First, we define the time period for which we want to analyse the data – here from January 2020 to December 2024. We also specify the ticker symbols: MBG.DE stands for Mercedes, ^GDAXI for the German stock index DAX.
+
+Load the monthly risk-free rate (see Appendix for source and further information):
+```{r}
+risk_free_monthly <- readRDS("risk_free_monthly_5 years.rds") %>%
+  mutate(
+    date_rf = ceiling_date(date, unit = "month") - days(1),  # Month-end
+    yearmon = as.yearmon(date_rf)
+  ) %>%
+  select(yearmon, rf_xts.Open)  # Only necessary columns
+
+head(risk_free_monthly)
+```
+The risk-free rate is essential for the CAPM model. We load a prepared file with risk-free interest rates and adjust the date to the last day of each month to make them more comparable to the returns.
+
+Fetch data:
+```{r}
+stock_data <- tq_get(symbols, from = start_date, to = end_date)
+```
+Using the tq_get() function from the tidyquant package, we retrieve the historical price data for the defined symbols over the specified time period.
+
+Calculate monthly returns with month-end dates:
+```{r}
+monthly_returns <- stock_data %>%
+  group_by(symbol) %>%  # Group by stock (Mercedes, DAX)
+  tq_transmute(
+    select = adjusted,              # Use the Adjusted Close price
+    mutate_fun = periodReturn,      # Function to calculate returns
+    period = "monthly",             # Calculate returns on a monthly basis
+    col_rename = "return",          # Name the column "return"
+    type = "log"                    # Log returns for regressions
+  )
+```
+For each stock, we now calculate returns on a monthly basis. We use logarithmic returns, as they offer certain mathematical advantages in financial analysis. The date is set to the last day of the month.
+
+Convert to wide format & rename columns:
+```{r}
+returns_wide <- monthly_returns %>%
+  pivot_wider(names_from = symbol, values_from = return) %>%  # Convert to wide format: one column per stock
+  drop_na() %>%  # Remove rows with missing values
+  rename(
+    mercedes = `MBG.DE`,     # Rename for better readability
+    market = `^GDAXI`        # DAX as market benchmark
+  ) %>%
+  mutate(
+    date = ceiling_date(date, unit = "month") - days(1),  # Calculate month-end
+    yearmon = as.yearmon(date)                            # Year-month format for later joins
+  )
+```
+To more easily compare the returns of Mercedes and the market index, we reshape the data into wide format. We rename the columns for clarity, remove missing values, and set the date to the last day of the month again.
+
+Merge with risk-free rate & calculate excess returns:
+```{r}
+returns_final_monthly <- returns_wide %>%
+  left_join(risk_free_monthly, by = "yearmon") %>%  # Join monthly returns with the risk-free rate
+  mutate(
+    R_f = rf_xts.Open,                               # Rename column for better readability
+    excess_mercedes = mercedes - R_f,                # Calculate Mercedes excess return
+    excess_market = market - R_f                     # Calculate market (DAX) excess return
+  ) %>%
+  select(date, yearmon, mercedes, market, R_f, excess_mercedes, excess_market)  # Select relevant columns
+```
+We now merge the monthly returns with the risk-free rates using the common yearmon key. We then calculate the so-called excess returns, i.e. the excess returns of Mercedes and the market compared to the risk-free investment.
+
+Dataframe check:
+```{r}
+head(returns_final_monthly)
+```
+Finally, we verify that the final dataset was created correctly by inspecting the first few rows.
+
+## Daily Returns
+In contrast to the monthly dataset, here we load daily price data and daily risk-free rates, calculate daily log returns, and determine the excess returns on a daily basis. The workflow remains structurally the same – the only difference is that aggregation and merging are done by date (date) rather than by month (yearmon).
+
+Load data from Yahoo Finance, set parameters & time period:
+```{r}
+start_date <- "2020-01-01"
+end_date <- "2024-12-31"
+symbols <- c("MBG.DE", "^GDAXI")  # Mercedes & DAX
+```
+Load the daily risk-free rate:
+```{r}
+risk_free_daily <- readRDS("risk_free_daily_5 years.rds")
+head(risk_free_daily)
+```
+Fetch data:
+```{r}
+stock_data <- tq_get(symbols, from = start_date, to = end_date)
+```
+Calculate daily returns:
+```{r}
+daily_returns <- stock_data %>%
+  group_by(symbol) %>%
+  tq_transmute(
+    select = adjusted,
+    mutate_fun = periodReturn,
+    period = "daily",         # ← CHANGE: now daily
+    type = "log",             
+    col_rename = "return"
+  )
+```
+Convert to wide format:
+```{r}
+returns_wide <- daily_returns %>%
+  pivot_wider(names_from = symbol, values_from = return) %>%
+  drop_na()
+
+returns_wide <- returns_wide %>%
+  rename(mercedes = `MBG.DE`,
+         market = `^GDAXI`)
+```
+Merge with risk-free rate:
+```{r}
+returns_final_daily <- returns_wide %>%
+  left_join(risk_free_daily, by = "date") %>%  # merge by date instead of yearmon
+  mutate(
+    R_f = risk_free,  # from the risk_free_daily table
+    excess_mercedes = mercedes - R_f,
+    excess_market = market - R_f
+  )
+head(returns_final_daily)
+```
+# Interactive Visualization with Shiny App
+
+**IMPORTANT**
+We have developed an interactive tool that allows users to dynamically analyse Beta and other risk factors. Users can flexibly select different time periods and window sizes to examine the evolution of the metrics over time in detail. The tool even offers extended time windows beyond the examples shown in the notebook. We warmly invite you to try the tool and explore the data for yourself.
+
+**CLICK THE LINK:**
+[Open Shiny App for Data Analysis](https://marleenb.shinyapps.io/shiny_app/)
+
+# Exploratory Data Analysis
+
+## Plot Returns as Time Series {.tabset}
+Before starting the regression, we want to get an overview of the monthly & daily returns of Mercedes and the DAX. The visualizations allow us to identify first patterns, trends, or anomalies.
+
+### Monthly Returns
+```{r, echo=FALSE, results='asis'}
+# Base plot with ggplot2
+p_monthly <- ggplot(returns_final_monthly, aes(x = date)) +
+  geom_line(aes(y = mercedes, color = "Mercedes")) +  # Line for Mercedes returns
+  geom_line(aes(y = market, color = "DAX")) +         # Line for DAX returns
+  labs(
+    title = "Monthly Returns: Mercedes vs. DAX",  # Plot title
+    y = "Return", x = "Date"                      # Axis labels
+  ) +
+  scale_color_manual(values = c("Mercedes" = "#A62321", "DAX" = "darkgrey")) +  # Assign colors
+  scale_x_date(
+    date_breaks = "3 months",  # x-axis in 3-month steps
+    labels = function(x) paste0("Q", lubridate::quarter(x), " ", lubridate::year(x))  # Quarterly axis labels
+  ) +
+  theme_minimal() +  # Clean, minimalist design
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels for readability
+
+# Interactive display with Plotly in an HTML div (full width)
+htmltools::browsable(
+  htmltools::tags$div(
+    style = "width:100%;",  # Set width to 100%
+    ggplotly(p_monthly) %>%
+      layout(autosize = TRUE) %>%     # Automatic resizing
+      config(responsive = TRUE)       # Enable responsive behaviour
+  )
+)
+```
+Monthly returns:
+- Due to the lower number of observations, estimates are more sensitive to outliers.
+- Less data means higher variance in regression coefficients → Beta often only becomes significant at larger time windows.
+- Fluctuations appear stronger, as monthly returns already bundle daily volatility.
+
+### Daily Returns
+```{r, echo=FALSE, results='asis'}
+p_daily <- ggplot(returns_final_daily, aes(x = date)) +
+  geom_line(aes(y = mercedes, color = "Mercedes")) +
+  geom_line(aes(y = market, color = "DAX")) +
+  labs(
+    title = "Daily Returns: Mercedes vs. DAX",
+    y = "Return", x = "Date"
+  ) +
+  scale_color_manual(values = c("Mercedes" = "#A62321", "DAX" = "darkgrey")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Wrapper div for full width
+htmltools::browsable(
+  htmltools::tags$div(
+    style = "width:100%;",
+    ggplotly(p_daily) %>%
+      layout(autosize = TRUE) %>%
+      config(responsive = TRUE)
+  )
+)
+```
+Daily returns:
+- Individual daily returns show high short-term fluctuations, but are statistically more stable at the aggregate level.
+- The large number of observations smooths out random outliers, so Beta estimates are often significant.
+- Fine market signals and short-term reactions are captured more precisely.
+
+## Scatterplot for Correlation {.tabset}
+To visually and statistically examine the relationship between the excess return of Mercedes (excess_mercedes) and the market (excess_market), we create a scatterplot with a regression line and calculate the correlation coefficient.
+
+### Monthly Returns
+```{r}
+# Base plot with scatter points
+fig <- plot_ly(data = returns_final_monthly, x = ~excess_market, y = ~excess_mercedes,
+               type = 'scatter', mode = 'markers',                    # Scatterplot with points
+               marker = list(color = 'blue'), name = 'Data Points')   # Color and legend name
+
+# Calculate regression line
+regression <- lm(excess_mercedes ~ excess_market, data = returns_final_monthly)  # Fit linear model
+x_vals <- seq(min(returns_final_monthly$excess_market, na.rm = TRUE),            # x values for line (min to max)
+              max(returns_final_monthly$excess_market, na.rm = TRUE), length.out = 100)
+y_vals <- predict(regression, newdata = data.frame(excess_market = x_vals))       # Predict y values for line
+
+# Add regression line
+fig <- fig %>% 
+  add_trace(x = x_vals, y = y_vals, type = 'scatter', mode = 'lines',            # Add line
+            line = list(color = 'red'), name = 'Regression Line') %>%             # Line in red with legend name
+  layout(title = list(text = "Regression: excess_mercedes ~ excess_market", x = 0.5), # Centered title
+         xaxis = list(title = "Excess Market Return"),                          # x-axis label
+         yaxis = list(title = "Excess Mercedes Return"))                        # y-axis label
+
+# Display plot at full width
+browsable(
+  tags$div(
+    style = "width:100%;",                                                       # Container at 100% width
+    fig %>% layout(autosize = TRUE) %>% config(responsive = TRUE)                # Make plot responsive
+  )
+)
+```
+Calculate correlation coefficient:
+```{r}
+cor(returns_final_monthly$mercedes, returns_final_monthly$market)
+```
+A value close to +1 indicates a strong positive correlation, while a value close to 0 indicates little or no linear relationship.
+
+### Daily Returns
+```{r}
+# Base plot with scatter points for daily excess returns
+fig <- plot_ly(data = returns_final_daily, x = ~excess_market, y = ~excess_mercedes,
+               type = 'scatter', mode = 'markers',
+               marker = list(color = 'blue'), name = 'Data Points')
+
+# Calculate regression line
+regression <- lm(excess_mercedes ~ excess_market, data = returns_final_daily)
+x_vals <- seq(min(returns_final_daily$excess_market, na.rm = TRUE),
+              max(returns_final_daily$excess_market, na.rm = TRUE), length.out = 100)
+y_vals <- predict(regression, newdata = data.frame(excess_market = x_vals))
+
+# Add regression line
+fig <- fig %>% 
+  add_trace(x = x_vals, y = y_vals, type = 'scatter', mode = 'lines',
+            line = list(color = 'red'), name = 'Regression Line') %>%
+  layout(title = list(text = "Regression (daily): excess_mercedes ~ excess_market", x = 0.5),
+         xaxis = list(title = "Excess Market Return (daily)"),
+         yaxis = list(title = "Excess Mercedes Return (daily)"))
+
+# Display plot at full width
+browsable(
+  tags$div(
+    style = "width:100%;",
+    fig %>% layout(autosize = TRUE) %>% config(responsive = TRUE)
+  )
+)
+```
+Calculate correlation coefficient:
+```{r}
+cor(returns_final_daily$mercedes, returns_final_daily$market)
+```
+A value close to +1 indicates a strong positive correlation, while a value close to 0 indicates little or no linear relationship.
+
+# CAPM
+In the next step, we run a classical CAPM regression for the excess returns of Mercedes relative to the market. We first inspect the linear model summary, then present the results in a table, and finally visualize the relationship between market and Mercedes returns including the regression line in an interactive plot.
+
+## Fit Linear Model {.tabset}
+
+### Monthly Returns
+```{r}
+capm_model <- lm(excess_mercedes ~ excess_market, data = returns_final_monthly)
+summary(capm_model)
+```
+Results as a table:
+```{r}
+tidy(capm_model)
+```
+
+### Daily Returns
+```{r}
+capm_model <- lm(excess_mercedes ~ excess_market, data = returns_final_daily)
+summary(capm_model)
+```
+Results as a table:
+```{r}
+tidy(capm_model)
+```
+## Visualize CAPM Line {.tabset}
+### Monthly Returns
+```{r}
+p_capm <- ggplot(returns_final_monthly, aes(x = excess_market, y = excess_mercedes)) +
+  geom_point(alpha = 0.5, color = "#A62321", size = 2) +
+  geom_smooth(method = "lm", color = "steelblue", se = TRUE, size = 1) +
+  labs(
+    title = "CAPM Estimation: Mercedes",
+    x = "Excess Market Return",
+    y = "Excess Mercedes Return"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Wrapper for full width
+browsable(
+  tags$div(
+    style = "width:100%;",
+    ggplotly(p_capm, tooltip = c("x", "y")) %>%
+      layout(autosize = TRUE) %>%
+      config(responsive = TRUE)
+  )
+)
+```
+
+### Daily Returns
+```{r}
+p_capm_daily <- ggplot(returns_final_daily, aes(x = excess_market, y = excess_mercedes)) +
+  geom_point(alpha = 0.5, color = "#A62321", size = 2) +
+  geom_smooth(method = "lm", color = "steelblue", se = TRUE, size = 1) +
+  labs(
+    title = "CAPM Estimation: Mercedes",
+    x = "Excess Market Return",
+    y = "Excess Mercedes Return"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Wrapper for full width
+browsable(
+  tags$div(
+    style = "width:100%;",
+    ggplotly(p_capm_daily, tooltip = c("x", "y")) %>%
+      layout(autosize = TRUE) %>%
+      config(responsive = TRUE)
+  )
+)
+```
+# Rolling Window Regression
+The following section demonstrates how we use rolling regressions across various window sizes to analyse the temporal evolution of Beta coefficients for Mercedes relative to the market. For each time window, the regression coefficients including significance are extracted and stored in a list.
+
+## Regression Calculation {.tabset}
+
+### Monthly Returns
+Rolling Regression:
+```{r}
+library(dplyr) # For data manipulation
+library(slider) # For rolling windows
+library(broom) # To extract model results
+library(tibble) # Optional: for modern data structure (tibble instead of data.frame)
+
+# Window sizes
+window_sizes_monthly <- c(6, 12, 24)
+
+# Store results as a list
+rolling_results_monthly_list <- list()
+
+# Loop
+for (window_size in window_sizes_monthly) {
+  rolling_results <- returns_final_monthly %>%
+    drop_na(excess_mercedes, excess_market) %>% # Remove missing values
+    slide_dfr(
+      .f = ~ {
+        # Rolling regression within the current window
+        model <- lm(excess_mercedes ~ excess_market, data = .x)
+        tidy_res <- tidy(model) %>% mutate(date = max(.x$date)) # Coefficients + date
+        glance_res <- glance(model) %>% select(r.squared) # Optional: model fit (R²)
+        bind_cols(tidy_res, glance_res) # Combine
+      },
+      .before = window_size - 1, # Set window size
+      .complete = TRUE   # Use only complete windows
+    ) %>%
+    mutate(significant = if_else(p.value < 0.05, TRUE, FALSE)) # Flag significance
+  
+  rolling_results_monthly_list[[as.character(window_size)]] <- rolling_results
+}
+```
+### Daily Returns
+We apply the same approach at the daily return level using shorter window sizes due to the large number of observations.
+Rolling Regression:
+```{r}
+# Window sizes for daily analysis (3, 6, 12 months ≈ 60, 120, 250 trading days)
+window_sizes_daily <- c(60, 120, 250)
+
+# Store results as a list
+rolling_results_daily_list <- list()
+
+for (window_size in window_sizes_daily) {
+  rolling_results <- returns_final_daily %>%
+    drop_na(excess_mercedes, excess_market) %>%
+    slide_dfr(
+      .f = ~ {
+        model <- lm(excess_mercedes ~ excess_market, data = .x)
+        tidy(model) %>% mutate(date = max(.x$date))
+      },
+      .before = window_size - 1,
+      .complete = TRUE
+    ) %>%
+    filter(term == "excess_market") %>%
+    mutate(significant = if_else(p.value < 0.05, TRUE, FALSE))
+  
+  rolling_results_daily_list[[as.character(window_size)]] <- rolling_results
+}
+```
+## Visualize Rolling Beta {.tabset}
+### Monthly Returns
+In the next step, we visualize the Rolling Beta of Mercedes using an example window size of 24 months to analyse the temporal evolution of the risk metric relative to the market.
+
+As a reference value, we use the Beta for the European automotive industry estimated by Damodaran. The Damodaran Beta value of 1.2 used in our analysis represents an approximation that lies between the unlevered Beta of 0.83 and the levered industry Beta of 1.63. This is intended to strike a balanced compromise between theoretical modelling and real-world practice. (Source: https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datacurrent.html#discrate).
+```{r}
+# Filter only the Beta estimates (coefficients of excess_market) from the 24-month results
+rolling_beta_monthly_24_beta_only <- rolling_results_monthly_list[["24"]] %>% 
+  filter(term == "excess_market")
+
+# Define plot using Beta-only data
+p_monthly <- ggplot(rolling_beta_monthly_24_beta_only, aes(x = date)) +
+  geom_line(aes(y = estimate, color = "Mercedes Beta"), size = 1) +        # Draw rolling Beta as a line
+  geom_hline(aes(yintercept = 1.2, linetype = "Damodaran Beta"),           # Horizontal reference line (Damodaran)
+             color = "grey40", size = 0.8) +
+  scale_color_manual(name = NULL, values = c("Mercedes Beta" = "#A62321")) + # Define line colors
+  scale_linetype_manual(name = NULL, values = c("Damodaran Beta" = "dashed")) + # Line type for Damodaran Beta
+  labs(
+    title = "Rolling Beta (Window = 24 Months) – Monthly Returns",         # Plot title
+    x = NULL,                                                              # No x-axis label
+    y = NULL                                                               # No y-axis label
+  ) +
+  theme_minimal() +                                                        # Use minimalist theme
+  theme(
+    legend.position = "bottom",                                            # Place legend at the bottom
+    panel.grid = element_blank(),                                          # No grid lines
+    axis.title.x = element_blank(),                                        # Remove x-axis title
+    axis.title.y = element_blank(),                                        # Remove y-axis title
+    plot.title = element_text(hjust = 0.5, face = "bold")                  # Center and bold title
+  )
+
+# Generate interactive output at full width
+htmltools::browsable(
+  htmltools::tags$div(
+    style = "width:100%;",                                                  # Container at full width
+    ggplotly(p_monthly) %>%                                                 # Convert ggplot to interactive Plotly
+      layout(autosize = TRUE) %>%                                           # Automatic resizing
+      config(responsive = TRUE)                                             # Enable responsive behaviour
+  )
+)
+```
+In the Beta visualization, we can see how the risk of Mercedes relative to the overall market (DAX) has changed over the past 24 months. The Rolling Beta shows fluctuations, meaning that the sensitivity of the Mercedes stock to market movements is not constant but adjusts over time.
+
+A Beta above 1 indicates that Mercedes reacts more strongly to market fluctuations than the market itself, while a Beta below 1 suggests lower volatility compared to the market. The dashed horizontal line at 1.2 (Damodaran Beta) serves as a reference value for comparison with the estimated Betas. Overall, this visualization helps us better understand the dynamic risk profile of the stock and observe whether and when market risk has changed.
+
+### Daily Returns
+Here we use an example window size of 120 days (6 months) for the visualization.
+```{r}
+# Extract the 120-day window
+rolling_beta_daily_120 <- rolling_results_daily_list[["120"]]
+
+# Define plot
+p_daily <- ggplot(rolling_beta_daily_120, aes(x = date)) +
+  geom_line(aes(y = estimate, color = "Mercedes Beta"), size = 1) +
+  geom_hline(aes(yintercept = 1.2, linetype = "Damodaran Beta"),
+             color = "grey40", size = 0.8) +
+  scale_color_manual(name = NULL, values = c("Mercedes Beta" = "#A62321")) +
+  scale_linetype_manual(name = NULL, values = c("Damodaran Beta" = "dashed")) +
+  labs(
+    title = "Rolling Beta (Window = 120 Days) – Daily Returns",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Interactive output
+htmltools::browsable(
+  htmltools::tags$div(
+    style = "width:100%;",
+    ggplotly(p_daily) %>%
+      layout(autosize = TRUE) %>%
+      config(responsive = TRUE)
+  )
+)
+```
+## Significance Plot {.tabset}
+The significance analysis of Beta values is central to making reliable statements about the systematic risk of a company relative to the overall market. Beta values feed into the calculation of the cost of equity, company valuations, and investment and financing decisions.
+
+However, a Beta value is only meaningful when it is **statistically significant**. A non-significant Beta value means that the observed relationship with the market could be random. The estimate is then uncertain and should not be used as a basis for decision-making.
+
+### Monthly Returns
+Monthly vs. Daily:
+For a sound decision-making basis, it is more appropriate to focus on monthly returns, because:
+- They are less affected by short-term noise.
+- Beta estimates become more stable and meaningful over longer time periods.
+- They provide a better assessment of long-term systematic risk.
+
+While daily data can be useful for short-term analyses, it should not serve as the primary basis for strategic decisions.
+```{r, echo=FALSE}
+# Initialize empty list for Plotly traces
+plot_data_monthly <- list()
+i <- 1
+
+# Loop over different window sizes (window_sizes_monthly)
+for (window_size in window_sizes_monthly) {
+  # Load rolling results for current window
+  rolling_results <- rolling_results_monthly_list[[as.character(window_size)]]
+
+  # Filter only Beta coefficients (term == "excess_market")
+  beta_results <- rolling_results %>% filter(term == "excess_market")
+
+  # Significant Beta values as scatter points (green circles)
+  trace_sig <- list(
+    x = beta_results$date[beta_results$significant],       # Dates for significant values only
+    y = beta_results$estimate[beta_results$significant],   # Beta estimates (significant)
+    type = 'scatter',                                       # Scatterplot
+    mode = 'markers',                                       # Points only
+    name = paste0("Significant (", window_size, "M)"),     # Legend name with window size
+    visible = ifelse(i == 1, TRUE, FALSE),                  # Visible only for first window by default
+    marker = list(color = "darkgreen", size = 6, symbol = "circle")  # Marker style
+  )
+
+  # Non-significant Beta values as scatter points (red crosses)
+  trace_nonsig <- list(
+    x = beta_results$date[!beta_results$significant],      # Dates of non-significant values
+    y = beta_results$estimate[!beta_results$significant],  # Beta estimates (non-significant)
+    type = 'scatter',
+    mode = 'markers',
+    name = paste0("Not significant (", window_size, "M)"),
+    visible = ifelse(i == 1, TRUE, FALSE),                  # Visible only for first window
+    marker = list(color = "red", size = 6, symbol = "x")    # Marker style (red cross)
+  )
+
+  # Line for Beta trend over time
+  trace_line <- list(
+    x = beta_results$date,                                  # Date
+    y = beta_results$estimate,                              # Beta estimates
+    type = 'scatter',
+    mode = 'lines',                                         # Line mode
+    name = paste0("Beta ", window_size, "M"),              # Legend name with window size
+    visible = ifelse(i == 1, TRUE, FALSE),                  # Visible only for first window
+    line = list(color = "#2C3E50", width = 2)               # Line color and width
+  )
+
+  # Add traces to the list: line, significant points, non-significant points
+  plot_data_monthly[[length(plot_data_monthly) + 1]] <- trace_line
+  plot_data_monthly[[length(plot_data_monthly) + 1]] <- trace_sig
+  plot_data_monthly[[length(plot_data_monthly) + 1]] <- trace_nonsig
+
+  # Increment index for next window
+  i <- i + 1
+}
+
+# Number of traces per window size (line + significant + not significant)
+num_traces_per_window <- 3
+
+# Prepare buttons for selecting window size
+buttons_monthly <- lapply(seq_along(window_sizes_monthly), function(i) {
+  # Set all traces to invisible initially
+  visibility <- rep(FALSE, length(plot_data_monthly))
+  
+  # Make only the three traces of the current window visible
+  start <- (i - 1) * num_traces_per_window + 1
+  visibility[start:(start + 2)] <- TRUE
+
+  # Button definition
+  list(
+    method = "update",                         # Update visibility on click
+    args = list(list(visible = visibility)), # Control trace visibility
+    label = paste0(window_sizes_monthly[i], " Months")  # Button label with window size
+  )
+})
+
+# Initialize empty Plotly object
+fig_monthly <- plot_ly()
+
+# Add all prepared traces to the plot
+for (trace in plot_data_monthly) {
+  fig_monthly <- fig_monthly %>% add_trace(
+    x = trace$x,
+    y = trace$y,
+    type = trace$type,
+    mode = trace$mode,
+    name = trace$name,
+    visible = trace$visible,
+    line = trace$line,
+    marker = trace$marker
+  )
+}
+
+# Define plot layout with title, axis labels, and update buttons
+fig_monthly <- fig_monthly %>%
+  layout(
+    title = list(text = "Rolling Beta – Monthly Returns with Significance", x = 0.5),
+    xaxis = list(title = "Date"),
+    yaxis = list(title = "Beta"),
+    updatemenus = list(
+      list(
+        type = "buttons",             # Buttons for switching
+        direction = "down",           # Vertical button arrangement
+        x = 1.05,                    # Position to the right of the plot
+        xanchor = "left",
+        y = 0.8,
+        yanchor = "top",
+        pad = list(r = 10, t = 10),  # Padding from plot border
+        buttons = buttons_monthly,    # List of buttons
+        showactive = TRUE             # Highlight active button
+      )
+    ),
+    legend = list(orientation = "h", x = 0.1, y = -0.25),  # Horizontal legend below plot
+    margin = list(r = 120)  # Extra space on the right for buttons
+  )
+
+# Output plot as HTML widget at full width
+htmltools::tags$div(
+  style = "width: 100%;",
+  plotly::ggplotly(fig_monthly)
+)
+```
+When calculating Beta based on monthly returns, a statistically significant relationship only emerges from a time window of approximately 24 months. This can be explained as follows:
+- **Small sample size**: Short time windows (e.g. 6–12 months) provide too few data points to enable stable estimates.
+- **High standard errors:** Uncertain estimates lead to higher p-values and thus to a lack of significance.
+
+Only with a larger number of observations over a longer time period can Beta be estimated more precisely and its significance statistically confirmed.
+
+### Daily Returns
+Monthly vs. Daily:
+For a sound decision-making basis, it is more appropriate to focus on monthly returns, because:
+- They are less affected by short-term noise.
+- Beta estimates become more stable and meaningful over longer time periods.
+- They provide a better assessment of long-term systematic risk.
+
+While daily data can be useful for short-term analyses, it should not serve as the primary basis for strategic decisions.
+```{r, echo=FALSE}
+# Plotly data list for daily
+plot_data_daily <- list()
+i <- 1
+
+for (window_size in window_sizes_daily) {
+  rolling_results <- rolling_results_daily_list[[as.character(window_size)]]
+
+  # Only Beta coefficients for significance
+  beta_results <- rolling_results %>% filter(term == "excess_market")
+
+  # Significant values (Beta only)
+  trace_sig <- list(
+    x = beta_results$date[beta_results$significant],
+    y = beta_results$estimate[beta_results$significant],
+    type = 'scatter',
+    mode = 'markers',
+    name = paste0("Significant (", window_size, "D)"),
+    visible = ifelse(i == 1, TRUE, FALSE),
+    marker = list(color = "darkgreen", size = 6, symbol = "circle")
+  )
+
+  # Non-significant values (Beta only)
+  trace_nonsig <- list(
+    x = beta_results$date[!beta_results$significant],
+    y = beta_results$estimate[!beta_results$significant],
+    type = 'scatter',
+    mode = 'markers',
+    name = paste0("Not significant (", window_size, "D)"),
+    visible = ifelse(i == 1, TRUE, FALSE),
+    marker = list(color = "red", size = 6, symbol = "x")
+  )
+
+  # Line for Beta trend
+  trace_line <- list(
+    x = beta_results$date,
+    y = beta_results$estimate,
+    type = 'scatter',
+    mode = 'lines',
+    name = paste0("Beta ", window_size, "D"),
+    visible = ifelse(i == 1, TRUE, FALSE),
+    line = list(color = "#2C3E50", width = 2)
+  )
+
+  plot_data_daily[[length(plot_data_daily) + 1]] <- trace_line
+  plot_data_daily[[length(plot_data_daily) + 1]] <- trace_sig
+  plot_data_daily[[length(plot_data_daily) + 1]] <- trace_nonsig
+
+  i <- i + 1
+}
+
+# Buttons for daily
+num_traces_per_window_daily <- 3
+buttons_daily <- lapply(seq_along(window_sizes_daily), function(i) {
+  visibility <- rep(FALSE, length(plot_data_daily))
+  start <- (i - 1) * num_traces_per_window_daily + 1
+  visibility[start:(start + 2)] <- TRUE
+
+  list(
+    method = "update",
+    args = list(list(visible = visibility)),
+    label = paste0(window_sizes_daily[i], " Days")
+  )
+})
+
+# Final plot for daily
+fig_daily <- plot_ly()
+
+for (trace in plot_data_daily) {
+  fig_daily <- fig_daily %>% add_trace(
+    x = trace$x,
+    y = trace$y,
+    type = trace$type,
+    mode = trace$mode,
+    name = trace$name,
+    visible = trace$visible,
+    line = trace$line,
+    marker = trace$marker
+  )
+}
+
+fig_daily <- fig_daily %>%
+  layout(
+    title = list(text = "Rolling Beta – Daily Returns with Significance", x = 0.5),
+    xaxis = list(title = "Date"),
+    yaxis = list(title = "Beta"),
+    updatemenus = list(
+      list(
+        type = "buttons",
+        direction = "down",
+        x = 1.05,
+        xanchor = "left",
+        y = 0.8,
+        yanchor = "top",
+        pad = list(r = 10, t = 10),
+        buttons = buttons_daily,
+        showactive = TRUE
+      )
+    ),
+    legend = list(orientation = "h", x = 0.1, y = -0.25),
+    margin = list(r = 120),
+    autosize = TRUE
+  ) %>%
+  config(responsive = TRUE)
+
+# Display plot
+htmltools::tags$div(
+  style = "width: 100%;",
+  plotly::ggplotly(fig_daily)
+)
+```
+Beta values for daily returns and shorter time windows appear significant because:
+- The large number of daily data points increases statistical power.
+
+However, caution is advised, as:
+- Short-term fluctuations (noise) can lead to biased but nonetheless significant results.
+- Significance does not necessarily reflect a reliable long-term risk assessment.
+
+# Appendix
+In addition to the Rolling Beta analysis, we examine the monthly Rolling Volatility, Rolling Sharpe Ratio, and Rolling Alpha to obtain a more comprehensive picture of Mercedes' risk, return, and performance dynamics over time. Caution is warranted, however, particularly with regard to Rolling Alpha, where the significance of the estimates should be carefully considered to avoid misinterpretation.
+
+## Rolling Alpha
+**Definition:** Alpha measures the risk-adjusted excess return of a portfolio relative to a benchmark and indicates whether an active manager has created additional value.
+**What it shows:** The time-varying excess return of a portfolio compared to a benchmark (e.g. market portfolio).
+**What can be observed:** Whether the portfolio has outperformed or underperformed the market over specific time periods – i.e. whether it consistently adds value.
+```{r}
+## Extract Rolling Alpha
+rolling_alpha_24 <- rolling_results_monthly_list[["24"]] %>%
+  filter(term == "(Intercept)") %>%
+  mutate(date = as.Date(date)) %>%
+  mutate(
+    t_value = estimate / std.error,
+    p_value = 2 * pt(-abs(t_value), df = 24 - 2),
+    signif = ifelse(p_value < 0.05, "significant", "not significant")
+  )
+
+# Plot with line and points, color points by significance
+p_alpha_24 <- ggplot(rolling_alpha_24, aes(x = date, y = estimate)) +
+  geom_line(linewidth = 0.5, color = "gray40") +  # Line in neutral grey
+  geom_point(aes(color = signif), size = 1) +   # Points colored by significance
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +  # Zero line
+  scale_color_manual(values = c("significant" = "darkgreen", "not significant" = "red")) +
+  labs(
+    title = "Rolling Alpha of Mercedes-Benz AG (24 Months)",
+    x = "Date",
+    y = "Alpha",
+    color = "Significance"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid = element_blank()
+  )
+
+# Interactive output with Plotly
+htmltools::tags$div(
+  style = "width: 100%;",
+  plotly::ggplotly(p_alpha_24)
+)
+```
+## Rolling R²
+**Definition:** The coefficient of determination (R²) indicates how well a regression model explains the variance of the dependent variable, and in financial analysis often reflects the degree of market dependence of a portfolio.
+**What it shows:** The proportion of the variance in portfolio returns explained by the market (benchmark), calculated over rolling time windows.
+**What can be observed:** How strongly the portfolio depends on the market during different periods. A declining R² may indicate reduced market dependence or a change in strategy.
+```{r}
+rolling_r2_tbl <- rolling_results_monthly_list[["24"]] %>%
+  distinct(date, r.squared)
+
+p_r2 <- plot_ly(
+  data = rolling_r2_tbl,
+  x = ~date,
+  y = ~r.squared,
+  type = 'scatter',
+  mode = 'lines',
+  line = list(color = 'purple'),
+  name = "Rolling R²"
+) %>%
+  layout(
+    title = "Rolling R² (Mercedes vs. Market, 24 Months)",
+    xaxis = list(title = "Date"),
+    yaxis = list(title = "R²", range = c(0, 1))
+  )
+
+htmltools::tags$div(
+  style = "width: 100%;",
+  p_r2
+)
+```
+## Visualize Rolling Volatility & Rolling Sharpe Ratio
+*Rolling Volatility*
+
+**Definition:** Volatility is a measure of portfolio risk and describes how strongly returns fluctuate around their mean.
+**What it shows:** The intensity of fluctuation (standard deviation) of portfolio returns over rolling time windows.
+**What can be observed:** How stable or volatile the portfolio was in different periods. Higher volatility means more risk, lower volatility means more stability.
+
+*Rolling Sharpe Ratio*
+
+**Definition:** The Sharpe Ratio measures the excess return of a portfolio per unit of risk taken (volatility).
+**What it shows:** The risk-adjusted return of a portfolio over time, calculated over rolling time windows.
+**What can be observed:** Whether the portfolio was adequately compensated for the risk taken over time. Fluctuations indicate changes in risk or performance.
+```{r}
+# Calculate Rolling Volatility & Sharpe Ratio (annualized)
+returns_final_monthly <- returns_final_monthly %>%
+  arrange(date) %>%
+  mutate(
+    rolling_volatility_24 = slide_dbl(
+      excess_mercedes,
+      ~ sd(.x, na.rm = TRUE) * sqrt(12),
+      .before = 23,
+      .complete = TRUE
+    ),
+    rolling_sharpe_24 = slide_dbl(
+      excess_mercedes,
+      ~ {
+        mean_excess <- mean(.x, na.rm = TRUE)
+        sd_excess <- sd(.x, na.rm = TRUE)
+        if (sd_excess == 0) return(NA_real_)
+        (mean_excess / sd_excess) * sqrt(12)
+      },
+      .before = 23,
+      .complete = TRUE
+    )
+  )
+
+# Individual plots
+p_vol <- plot_ly(returns_final_monthly, x = ~date, y = ~rolling_volatility_24, type = 'scatter', mode = 'lines',
+                 line = list(color = 'blue'), name = "Rolling Volatility (24 Months)") %>%
+  layout(yaxis = list(title = "Volatility"))
+
+p_sharpe <- plot_ly(returns_final_monthly, x = ~date, y = ~rolling_sharpe_24, type = 'scatter', mode = 'lines',
+                    line = list(color = 'green'), name = "Rolling Sharpe Ratio (24 Months)") %>%
+  layout(yaxis = list(title = "Sharpe Ratio"))
+
+# Create subplot
+combined_plot <- subplot(p_vol, p_sharpe, nrows = 2, shareX = TRUE, titleX = TRUE) %>%
+  layout(margin = list(l = 50, r = 50, t = 50, b = 50))
+
+# HTML container with CSS for 100% width
+htmltools::tags$div(
+  style = "width: 100%; height: auto; min-height: 400px; max-height: 70vh;",
+  combined_plot
+)
+```
+
+## Additional Data Preparation
+### Data Check
+We conduct a data check of the loaded financial data by comparing the data from the tidyquant function with Yahoo Finance data for MBG.DE and the DAX imported via .csv. We follow the approach from Chapter 1 of the book:
+Ang, C. S. (2021). Analyzing Financial Data and Implementing Financial Models Using R (2nd ed.). Springer Nature Switzerland AG. https://doi.org/10.1007/978-3-030-64155-9.
+
+Load and clean CSV data:
+```{r}
+setwd("~/Desktop/Rolling Window Regression")
+
+# MBG
+mbg <- read.csv("MBG_DE_2020_2024.csv", skip = 2)
+colnames(mbg)[1] <- "Date"
+colnames(mbg) <- c("Date", "Adj_Close", "Close", "High", "Low", "Open", "Volume")
+mbg$Date <- as.Date(mbg$Date)
+numeric_cols <- c("Adj_Close", "Close", "High", "Low", "Open", "Volume")
+mbg[numeric_cols] <- lapply(mbg[numeric_cols], as.numeric)
+mbg_xts <- xts(mbg[, numeric_cols], order.by = mbg$Date)
+
+# DAX
+dax_csv <- read.csv("GDAXI_2020_2024.csv", skip = 2)
+colnames(dax_csv)[1] <- "Date"
+colnames(dax_csv) <- c("Date", "Adj_Close", "Close", "High", "Low", "Open", "Volume")
+dax_csv$Date <- as.Date(dax_csv$Date)
+numeric_cols <- c("Adj_Close", "Close", "High", "Low", "Open", "Volume")  # define again
+dax_csv[numeric_cols] <- lapply(dax_csv[numeric_cols], as.numeric)
+dax_xts <- xts(dax_csv[, "Adj_Close"], order.by = dax_csv$Date)
+```
+
+Price visualization:
+```{r}
+plot(mbg_xts$Adj_Close, main = "MBG Adj_Close Prices", ylab = "Adj. Close Price", xlab = "Date", col = "black")
+```
+
+Calculate German trading days:
+```{r}
+library(timeDate)
+start_date <- as.Date("2020-01-01")
+end_date <- as.Date("2024-12-31")
+all_days <- seq(start_date, end_date, by = "days")
+trading_days <- all_days[!weekdays(all_days) %in% c("Saturday", "Sunday")]
+
+holidays_de <- c(
+  as.Date(Easter(2020)) + c(-2, 1),
+  as.Date(Easter(2021)) + c(-2, 1),
+  as.Date(Easter(2022)) + c(-2, 1),
+  as.Date(Easter(2023)) + c(-2, 1),
+  as.Date(Easter(2024)) + c(-2, 1),
+  as.Date(paste0(2020:2024, "-01-01")),
+  as.Date(paste0(2020:2024, "-05-01")),
+  as.Date(paste0(2020:2024, "-10-03")),
+  as.Date(paste0(2020:2024, "-12-24")),
+  as.Date(paste0(2020:2024, "-12-25")),
+  as.Date(paste0(2020:2024, "-12-26")),
+  as.Date(paste0(2020:2024, "-12-31"))
+)
+
+trading_days <- setdiff(trading_days, holidays_de)
+length(trading_days)
+```
+
+Summary Statistics:
+```{r}
+summary(mbg_xts$Adj_Close,dax_xts$Adj_Close)
+```
+
+Load and normalize Yahoo Finance data:
+```{r}
+mbg_yahoo <- tq_get("MBG.DE", from = "2020-01-01", to = "2024-12-31")
+dax_yahoo <- tq_get("^GDAXI", from = "2020-01-01", to = "2024-12-31")
+
+mbg_yahoo_xts <- xts(mbg_yahoo$adjusted, order.by = mbg_yahoo$date)
+dax_yahoo_xts <- xts(dax_yahoo$adjusted, order.by = dax_yahoo$date)
+
+mbg_norm_yahoo <- (mbg_yahoo_xts / as.numeric(mbg_yahoo_xts[1])) * 100
+dax_norm_yahoo <- (dax_yahoo_xts / as.numeric(dax_yahoo_xts[1])) * 100
+```
+
+Compare MBG CSV vs. Yahoo Finance:
+```{r}
+mbg_xts_adj <- mbg_xts$Adj_Close
+mbg_norm_csv <- (mbg_xts_adj / as.numeric(mbg_xts_adj[1])) * 100
+
+mbg_compare <- merge(mbg_norm_csv, mbg_norm_yahoo, all = TRUE)
+colnames(mbg_compare) <- c("CSV", "Yahoo")
+mbg_compare_clean <- na.omit(mbg_compare)
+
+plot.zoo(mbg_compare_clean, plot.type = "single", col = c("blue", "green"),
+         main = "Normalized Prices: MBG (CSV) vs. Yahoo Finance", ylab = "Normalized Price", xlab = "Date")
+legend("topleft", legend = c("MBG (CSV)", "MBG (Yahoo)"), col = c("blue", "green"), lty = 1)
+```
+
+```{r}
+library(kableExtra)
+mbg_table <- data.frame(
+  Date = index(mbg_compare_clean),
+  MBG_CSV = as.numeric(mbg_compare_clean$CSV),
+  MBG_Yahoo = as.numeric(mbg_compare_clean$Yahoo)
+)
+mbg_table$Difference <- abs(mbg_table$MBG_CSV - mbg_table$MBG_Yahoo)
+mbg_differences <- mbg_table %>% filter(Difference > 0.01)
+
+mbg_differences %>%
+  head(10) %>%
+  kable(digits = 4, caption = "Rows with Differences Between MBG (CSV) and Yahoo") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped"))
+```
+
+Compare DAX CSV vs. Yahoo Finance:
+```{r}
+dax_norm_csv <- (dax_xts / as.numeric(dax_xts[1])) * 100
+dax_compare <- merge(dax_norm_csv, dax_norm_yahoo, join = "inner")
+colnames(dax_compare) <- c("CSV", "Yahoo")
+
+dax_table <- data.frame(
+  Date = index(dax_compare),
+  DAX_CSV = as.numeric(dax_compare[, "CSV"]),
+  DAX_Yahoo = as.numeric(dax_compare[, "Yahoo"])
+)
+dax_table$Difference <- abs(dax_table$DAX_CSV - dax_table$DAX_Yahoo)
+dax_differences <- dax_table %>% filter(Difference > 0.01)
+
+dax_differences %>%
+  head(10) %>%
+  kable(digits = 4, caption = "Rows with Differences Between DAX (CSV) and Yahoo") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped"))
+```
+
+### Risk Free Rate {.tabset}
+This section shows the individual steps for extracting the risk-free rate from an external R script. The source used is the daily yields of the current five-year Federal notes ("Daily yield of the current five-year Federal notes").
+Source: https://www.bundesbank.de/en/statistics/money-and-capital-markets/interest-rates-and-yields/daily-yields-of-current-federal-securities-772220.
+
+#### Monthly
+```{r}
+# Load packages
+library(xts)
+library(dplyr)
+library(lubridate)
+library(zoo)
+
+# Set working directory
+setwd("~/Desktop/Rolling Window Regression")
+
+# Read CSV data (Federal bond)
+rf <- read.csv("BBSSY.D.REN.EUR.A620.000000WT0505.A.csv", skip = 8)
+colnames(rf) <- c("Date", "Bundesanleihe", "na")
+rf <- rf %>% 
+  select(-na) %>% 
+  filter(Bundesanleihe != ".")
+
+# Convert date format & numeric values
+rf$Date <- as.Date(rf$Date)
+rf$Bundesanleihe <- as.numeric(as.character(rf$Bundesanleihe))
+
+# Filter to time period
+rf <- rf %>% filter(Date >= as.Date("2020-01-01") & Date <= as.Date("2024-12-31"))
+
+# Create xts object
+rf_xts <- xts(rf$Bundesanleihe, order.by = rf$Date)
+colnames(rf_xts) <- "Bundesanleihe"
+
+# Aggregate to monthly data
+rf_monthly_xts <- to.monthly(rf_xts)
+
+# Calculate monthly return from Open value (annual rate)
+monthly_rf_xts <- (1 + rf_monthly_xts[, "rf_xts.Open"] / 100)^(1 / 12) - 1
+
+# Convert to dataframe
+risk_free_monthly <- data.frame(
+  date = index(monthly_rf_xts),
+  risk_free = coredata(monthly_rf_xts)
+)
+
+# Convert yearmon → Date (month-end)
+risk_free_monthly$date <- as.Date(as.yearmon(risk_free_monthly$date), frac = 1)
+
+# Set date to month-end for CAPM alignment
+risk_free_monthly <- risk_free_monthly %>%
+  mutate(date = ceiling_date(date, unit = "month") - days(1))
+
+# Preview
+head(risk_free_monthly)
+nrow(risk_free_monthly)  # Should equal the number of months
+
+# Save for later import
+saveRDS(risk_free_monthly, file = "risk_free_monthly_5 years.rds")
+```
+#### Daily
+```{r}
+# Load packages
+library(xts)
+library(dplyr)
+library(lubridate)
+library(zoo)
+
+# Set working directory
+setwd("~/Desktop/Rolling Window Regression")
+
+# Read CSV data (Federal bond)
+rf <- read.csv("BBSSY.D.REN.EUR.A620.000000WT0505.A.csv", skip = 8)
+colnames(rf) <- c("Date", "Bundesanleihe", "na")
+
+# Clean and format
+rf <- rf %>% 
+  select(-na) %>% 
+  filter(Bundesanleihe != ".") %>%
+  mutate(
+    Date = as.Date(Date),
+    Bundesanleihe = as.numeric(as.character(Bundesanleihe))
+  ) %>%
+  filter(Date >= as.Date("2020-01-01") & Date <= as.Date("2024-12-31"))
+
+# Calculate daily risk-free rate (annualized → daily)
+rf <- rf %>%
+  mutate(
+    risk_free = (1 + Bundesanleihe / 100)^(1 / 252) - 1  # 252 trading days
+  ) %>%
+  select(date = Date, risk_free)
+
+# Preview
+head(rf)
+nrow(rf)
+
+# Save
+saveRDS(rf, file = "risk_free_daily_5 years.rds")
+```
